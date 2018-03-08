@@ -14,11 +14,14 @@ import (
 	"unsafe"
 )
 
+var input *C.ZSTD_inBuffer = (*C.ZSTD_inBuffer)(C.malloc(C.size_t(24)))
+var output *C.ZSTD_outBuffer = (*C.ZSTD_outBuffer)(C.malloc(C.size_t(unsafe.Sizeof(24))))
+
 // Writer is an io.WriteCloser that zstd-compresses its input.
 type Writer struct {
 	CompressionLevel int
 
-	ctx              *C.ZSTD_CCtx
+	cstream          *C.ZSTD_CCtx
 	dict             []byte
 	dstBuffer        []byte
 	firstError       error
@@ -57,14 +60,13 @@ func NewWriterLevel(w io.Writer, level int) *Writer {
 // should not be modified until the writer is closed.
 func NewWriterLevelDict(w io.Writer, level int, dict []byte) *Writer {
 	var err error
-	ctx := C.ZSTD_createCCtx()
+	cstream := C.ZSTD_createCStream()
 
 	if dict == nil {
-		err = getError(int(C.ZSTD_compressBegin(ctx,
-			C.int(level))))
+		err = getError(int(C.ZSTD_initCStream(cstream, C.int(level))))
 	} else {
-		err = getError(int(C.ZSTD_compressBegin_usingDict(
-			ctx,
+		err = getError(int(C.ZSTD_initCStream_usingDict(
+			cstream,
 			unsafe.Pointer(&dict[0]),
 			C.size_t(len(dict)),
 			C.int(level))))
@@ -72,7 +74,7 @@ func NewWriterLevelDict(w io.Writer, level int, dict []byte) *Writer {
 
 	return &Writer{
 		CompressionLevel: level,
-		ctx:              ctx,
+		cstream:          cstream,
 		dict:             dict,
 		dstBuffer:        make([]byte, CompressBound(1024)),
 		firstError:       err,
@@ -93,25 +95,29 @@ func (w *Writer) Write(p []byte) (int, error) {
 		w.dstBuffer = make([]byte, CompressBound(len(p)))
 	}
 
-	retCode := C.ZSTD_compressContinue(
-		w.ctx,
-		unsafe.Pointer(&w.dstBuffer[0]),
-		C.size_t(len(w.dstBuffer)),
-		unsafe.Pointer(&p[0]),
-		C.size_t(len(p)))
+	var err error
+	input.src = unsafe.Pointer(&p[0])
+	input.size = C.size_t(len(p))
+	input.pos = C.size_t(0)
+	for input.pos < input.size {
+		output.dst = unsafe.Pointer(&w.dstBuffer[0])
+		output.size = C.size_t(len(w.dstBuffer))
+		output.pos = C.size_t(0)
 
-	if err := getError(int(retCode)); err != nil {
-		return 0, err
-	}
-	written := int(retCode)
+		retCode := C.ZSTD_compressStream(w.cstream, output, input)
+		if err := getError(int(retCode)); err != nil {
+			return 0, err
+		}
 
-	// Write to underlying buffer
-	_, err := w.underlyingWriter.Write(w.dstBuffer[:written])
+		// Write to underlying buffer
+		written := int(output.pos)
+		_, err = w.underlyingWriter.Write(w.dstBuffer[:written])
 
-	// Same behaviour as zlib, we can't know how much data we wrote, only
-	// if there was an error
-	if err != nil {
-		return 0, err
+		// Same behaviour as zlib, we can't know how much data we wrote, only
+		// if there was an error
+		if err != nil {
+			return 0, err
+		}
 	}
 	return len(p), err
 }
@@ -119,27 +125,27 @@ func (w *Writer) Write(p []byte) (int, error) {
 // Close closes the Writer, flushing any unwritten data to the underlying
 // io.Writer and freeing objects, but does not close the underlying io.Writer.
 func (w *Writer) Close() error {
-	retCode := C.ZSTD_compressEnd(
-		w.ctx,
-		unsafe.Pointer(&w.dstBuffer[0]),
-		C.size_t(len(w.dstBuffer)),
-		unsafe.Pointer(nil),
-		C.size_t(0))
-
-	if err := getError(int(retCode)); err != nil {
-		return err
+	for {
+		output.dst = unsafe.Pointer(&w.dstBuffer[0])
+		output.size = C.size_t(len(w.dstBuffer))
+		output.pos = C.size_t(0)
+		retCode := C.ZSTD_endStream(w.cstream, output)
+		if err := getError(int(retCode)); err != nil {
+			return err
+		}
+		written := int(output.pos)
+		if written > 0 {
+			_, err := w.underlyingWriter.Write(w.dstBuffer[:written])
+			if err != nil {
+				return err
+			}
+		} else {
+			break
+		}
 	}
-	written := int(retCode)
-	retCode = C.ZSTD_freeCCtx(w.ctx) // Safely close buffer before writing the end
 
-	if err := getError(int(retCode)); err != nil {
-		return err
-	}
+	C.ZSTD_freeCStream(w.cstream)
 
-	_, err := w.underlyingWriter.Write(w.dstBuffer[:written])
-	if err != nil {
-		return err
-	}
 	return nil
 }
 
