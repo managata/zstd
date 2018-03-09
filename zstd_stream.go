@@ -125,6 +125,8 @@ func (w *Writer) Write(p []byte) (int, error) {
 // Close closes the Writer, flushing any unwritten data to the underlying
 // io.Writer and freeing objects, but does not close the underlying io.Writer.
 func (w *Writer) Close() error {
+	defer C.ZSTD_freeCStream(w.cstream)
+
 	for {
 		output.dst = unsafe.Pointer(&w.dstBuffer[0])
 		output.size = C.size_t(len(w.dstBuffer))
@@ -143,8 +145,6 @@ func (w *Writer) Close() error {
 			break
 		}
 	}
-
-	C.ZSTD_freeCStream(w.cstream)
 
 	return nil
 }
