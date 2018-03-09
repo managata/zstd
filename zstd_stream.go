@@ -76,7 +76,7 @@ func NewWriterLevelDict(w io.Writer, level int, dict []byte) *Writer {
 		CompressionLevel: level,
 		cstream:          cstream,
 		dict:             dict,
-		dstBuffer:        make([]byte, CompressBound(1024)),
+		dstBuffer:        make([]byte, CompressBound(4096)),
 		firstError:       err,
 		underlyingWriter: w,
 	}
