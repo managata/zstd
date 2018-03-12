@@ -5,6 +5,7 @@ package zstd
 #define ZBUFF_DISABLE_DEPRECATE_WARNINGS
 #include "zstd.h"
 #include "zbuff.h"
+#include <stdlib.h>
 */
 import "C"
 import (
@@ -13,9 +14,6 @@ import (
 	"io"
 	"unsafe"
 )
-
-var input *C.ZSTD_inBuffer = (*C.ZSTD_inBuffer)(C.malloc(C.size_t(24)))
-var output *C.ZSTD_outBuffer = (*C.ZSTD_outBuffer)(C.malloc(C.size_t(unsafe.Sizeof(24))))
 
 // Writer is an io.WriteCloser that zstd-compresses its input.
 type Writer struct {
@@ -26,6 +24,8 @@ type Writer struct {
 	dstBuffer        []byte
 	firstError       error
 	underlyingWriter io.Writer
+	inbuf            *C.ZSTD_inBuffer
+	outbuf           *C.ZSTD_outBuffer
 }
 
 func resize(in []byte, newSize int) []byte {
@@ -79,6 +79,8 @@ func NewWriterLevelDict(w io.Writer, level int, dict []byte) *Writer {
 		dstBuffer:        make([]byte, CompressBound(4096)),
 		firstError:       err,
 		underlyingWriter: w,
+		inbuf:            (*C.ZSTD_inBuffer)(C.malloc(C.size_t(24))),
+		outbuf:           (*C.ZSTD_outBuffer)(C.malloc(C.size_t(unsafe.Sizeof(24)))),
 	}
 }
 
@@ -96,21 +98,21 @@ func (w *Writer) Write(p []byte) (int, error) {
 	}
 
 	var err error
-	input.src = unsafe.Pointer(&p[0])
-	input.size = C.size_t(len(p))
-	input.pos = C.size_t(0)
-	for input.pos < input.size {
-		output.dst = unsafe.Pointer(&w.dstBuffer[0])
-		output.size = C.size_t(len(w.dstBuffer))
-		output.pos = C.size_t(0)
+	w.inbuf.src = unsafe.Pointer(&p[0])
+	w.inbuf.size = C.size_t(len(p))
+	w.inbuf.pos = C.size_t(0)
+	for w.inbuf.pos < w.inbuf.size {
+		w.outbuf.dst = unsafe.Pointer(&w.dstBuffer[0])
+		w.outbuf.size = C.size_t(len(w.dstBuffer))
+		w.outbuf.pos = C.size_t(0)
 
-		retCode := C.ZSTD_compressStream(w.cstream, output, input)
+		retCode := C.ZSTD_compressStream(w.cstream, w.outbuf, w.inbuf)
 		if err := getError(int(retCode)); err != nil {
 			return 0, err
 		}
 
 		// Write to underlying buffer
-		written := int(output.pos)
+		written := int(w.outbuf.pos)
 		_, err = w.underlyingWriter.Write(w.dstBuffer[:written])
 
 		// Same behaviour as zlib, we can't know how much data we wrote, only
@@ -125,17 +127,21 @@ func (w *Writer) Write(p []byte) (int, error) {
 // Close closes the Writer, flushing any unwritten data to the underlying
 // io.Writer and freeing objects, but does not close the underlying io.Writer.
 func (w *Writer) Close() error {
-	defer C.ZSTD_freeCStream(w.cstream)
+	defer func() {
+		C.ZSTD_freeCStream(w.cstream)
+		C.free(unsafe.Pointer(w.inbuf))
+		C.free(unsafe.Pointer(w.outbuf))
+	}()
 
 	for {
-		output.dst = unsafe.Pointer(&w.dstBuffer[0])
-		output.size = C.size_t(len(w.dstBuffer))
-		output.pos = C.size_t(0)
-		retCode := C.ZSTD_endStream(w.cstream, output)
+		w.outbuf.dst = unsafe.Pointer(&w.dstBuffer[0])
+		w.outbuf.size = C.size_t(len(w.dstBuffer))
+		w.outbuf.pos = C.size_t(0)
+		retCode := C.ZSTD_endStream(w.cstream, w.outbuf)
 		if err := getError(int(retCode)); err != nil {
 			return err
 		}
-		written := int(output.pos)
+		written := int(w.outbuf.pos)
 		if written > 0 {
 			_, err := w.underlyingWriter.Write(w.dstBuffer[:written])
 			if err != nil {
